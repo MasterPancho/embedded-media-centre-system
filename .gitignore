@@ -1,0 +1,21 @@
+# Keil build output
+firmware/Obj/
+firmware/Lst/
+
+# Compiled binaries
+*.axf
+*.hex
+*.bin
+*.lnp
+
+# Build reports
+*.htm
+*.build_log.htm
+
+# Keil user-specific workspace files
+*.uvopt
+*.uvoptx
+*.uvguix.*
+*.uvproj.saved_uv4
+*.dep
+usbaudio_Flash.dep

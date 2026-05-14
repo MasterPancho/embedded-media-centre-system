@@ -1,6 +1,6 @@
 # Embedded Media Centre
 
-A bare-metal multimedia system for the **NXP LPC1768** (ARM Cortex-M3) microcontroller. Built entirely without an RTOS, it runs a joystick-driven interface with four independent modes: a photo gallery, a USB audio player, a snake game, and a pong game — all displayed on an SPI-driven GLCD.
+A bare-metal embedded multimedia system built on the **NXP LPC1768 ARM Cortex-M3** microcontroller using the **Keil MCB1700** evaluation board. The project integrates graphical rendering, USB audio streaming, real-time joystick interaction, and embedded game logic into a compact multimedia application — all running without an operating system.
 
 ---
 
@@ -18,22 +18,34 @@ A bare-metal multimedia system for the **NXP LPC1768** (ARM Cortex-M3) microcont
 
 ## Table of Contents
 
+- [Overview](#overview)
 - [Features](#features)
 - [Hardware](#hardware)
 - [Architecture](#architecture)
-- [Modes](#modes)
+- [Control Logic](#control-logic)
+- [Modules](#modules)
+- [Image Conversion Workflow](#image-conversion-workflow)
 - [Project Structure](#project-structure)
-- [Getting Started](#getting-started)
-- [USB Audio Setup](#usb-audio-setup)
+- [Testing](#testing)
+- [Key Technical Concepts](#key-technical-concepts)
+- [Future Improvements](#future-improvements)
+
+---
+
+## Overview
+
+The Embedded Media Centre is a standalone application that runs directly on the LPC1768 microcontroller. It provides a graphical menu interface for navigating between three main modules: a Photo Gallery, an MP3 Player, and a Game Module.
+
+The application uses a modular, event-driven architecture to manage transitions between modules while sharing hardware peripherals — the GLCD, joystick, DAC, ADC, Timer0, and USB interface. There is no OS, scheduler, or dynamic memory allocation; all logic runs in a cooperative super-loop with interrupt-driven audio.
 
 ---
 
 ## Features
 
-- Joystick-navigated menu system with instant mode switching
-- Full-colour photo gallery with left/right navigation
-- USB Audio Device — streams PC audio to the on-board DAC in real time
-- Snake game with collision detection, growing body, and score tracking
+- Joystick-navigated menu system with instant, flicker-free mode switching
+- Full-colour photo gallery — images stored as RGB565 C arrays in flash
+- USB Audio Device — streams audio from a host PC to the on-board DAC in real time
+- Snake game with joystick control, food generation, growth, and collision detection
 - Pong game with CPU-controlled opponent and win/lose detection
 - Potentiometer-controlled volume via ADC
 - No RTOS — fully cooperative bare-metal super-loop
@@ -44,19 +56,21 @@ A bare-metal multimedia system for the **NXP LPC1768** (ARM Cortex-M3) microcont
 
 | Component | Detail |
 |-----------|--------|
-| MCU | NXP LPC1768 — ARM Cortex-M3 @ 100 MHz |
+| Microcontroller | NXP LPC1768 — ARM Cortex-M3 @ 100 MHz |
 | Board | Keil MCB1700 |
-| Display | GLCD 240×320 via SPI (Nokia 6610 compatible) |
+| Display | GLCD 240×320 via SPI |
 | Audio output | On-board DAC driven by Timer0 IRQ @ 32 kHz |
-| Audio input | USB Audio Device Class (Windows generic driver) |
+| Audio input | USB Audio Device Class — Windows generic driver |
 | User input | On-board 5-way joystick |
-| Volume control | Potentiometer read via ADC |
+| Volume control | On-board potentiometer via ADC |
+| Timer | Timer0 — audio sample timing |
+| Development environment | Keil uVision 5 |
 
 ---
 
 ## Architecture
 
-The firmware is structured as a **bare-metal cooperative super-loop**. There is no scheduler or RTOS — all mode logic runs sequentially in `main()`.
+The firmware is structured as a **bare-metal cooperative super-loop**. There is no scheduler — all mode logic runs sequentially in `main()`, with audio handled entirely through hardware interrupts.
 
 ```
 main()
@@ -70,10 +84,9 @@ main()
 
 ### Mode Switching
 
-A single global `AppMode currentMode` variable controls which subsystem is active. When `currentMode` changes, the loop detects the transition, clears the screen, and calls the incoming mode's `Init*()` function exactly once to set up its UI. The `Run*()` function then handles all ongoing logic — joystick polling, state updates, and display redraws — on every loop tick.
+A single global `AppMode currentMode` variable controls which subsystem is active. When `currentMode` changes, the loop detects the transition, clears the screen, and calls the incoming module's `Init*()` function exactly once. The `Run*()` function then handles all ongoing logic — joystick polling, state updates, and display redraws — on every tick. This design limits screen flicker and keeps transitions clean.
 
 ```c
-// Simplified from main.c
 if (currentMode != previousMode) {
     GLCD_Clear(White);
     Init*();                 // one-time setup
@@ -82,48 +95,97 @@ if (currentMode != previousMode) {
 Run*(stickDir, &prevStickDir, &currentMode);  // continuous update
 ```
 
-Joystick input uses **edge detection** — actions only fire when the direction *changes*, not while it is held. This prevents unintended repeated inputs.
-
 ### USB Audio (MP3 Player)
 
-The MP3 Player mode is interrupt-driven rather than polled. When selected, `RunMP3Player()` configures the hardware and hands control to two interrupt handlers:
+The MP3 Player is interrupt-driven rather than polled. Two hardware interrupt handlers work as a producer/consumer pair:
 
-- **Timer0 IRQ** fires at **32 kHz** (one tick per audio sample). On each tick it reads the next sample from a circular DMA buffer, applies the potentiometer volume, and writes the result to the DAC.
-- **USB IRQ** fires when a new USB isochronous packet arrives from the host PC. It writes the incoming PCM audio data into the DMA buffer.
+- **USB IRQ** — fires when a new isochronous packet arrives from the host PC and writes incoming PCM data into a circular DMA buffer in USB RAM.
+- **Timer0 IRQ** — fires at **32 kHz** (one tick per audio sample). On each tick it reads the next sample from the buffer, applies potentiometer volume scaling, and writes the result to the DAC.
 
-The two handlers work as a producer/consumer pair — USB fills the buffer, Timer0 drains it to the DAC. A scatter file (`DMA.sct`) explicitly places the USB DMA buffer in the dedicated USB RAM region (`0x2007C000`) required by the LPC1768 hardware.
-
-Pressing the joystick centre while in MP3 mode disables both IRQs, disconnects USB, and returns to the main menu.
+A scatter file (`DMA.sct`) explicitly places the DMA buffer in the dedicated USB RAM region (`0x2007C000`) required by the LPC1768 USB peripheral. When the user exits the MP3 Player, the system cleanly disables both IRQs, stops audio output, and disconnects USB before returning to the main menu.
 
 ### Display
 
-All rendering goes through the GLCD driver (`GLCD_SPI_LPC1700.c`), which communicates with the LCD controller over SPI. Text is drawn using two embedded bitmap fonts (6×8 and 16×24 pixels). Images are stored as **RGB565 C arrays** (`images/*.c`) compiled directly into flash and blasted to the screen with a single `GLCD_Bitmap()` call.
+All rendering goes through `GLCD_SPI_LPC1700.c`, which communicates with the LCD controller over SPI. Text is drawn using two embedded bitmap fonts (6×8 and 16×24 pixels). Images are stored as **RGB565 C arrays** compiled directly into flash and rendered with a single `GLCD_Bitmap()` burst call.
 
 ### Games
 
-Both games run their own internal loops (blocking `while` loops) rather than returning to `main()`. This keeps their logic self-contained:
+Both games run self-contained internal `while` loops rather than returning to `main()` on each tick:
 
-- **Snake** — moves on a 20×10 character grid. The snake body is stored as an array of `{x, y}` structs. Each tick the tail cell is erased, all segments shift forward, and the head advances in the last joystick direction. Collision with walls or self sets `isAlive = false` and ends the loop.
-- **Pong** — tracks ball position as `double {x, y}` with `{dx, dy}` velocity. The CPU paddle follows the ball's y-position with randomised lag to make it beatable. Scoring resets the ball; first to 3 points wins.
+- **Snake** — moves on a 20×10 character grid. The body is stored as an array of `{x, y}` structs. Each tick the tail cell is erased, all segments shift forward, and the head advances in the last joystick direction. Collision with walls or self ends the loop.
+- **Pong** — tracks ball position as `double {x, y}` with `{dx, dy}` velocity. The CPU paddle follows the ball's y-position with a randomness factor to keep gameplay competitive. First to 3 points wins.
 
 ---
 
-## Modes
+## Control Logic
+
+Joystick input uses **edge detection** — the current state is compared against the previous state so actions fire only when the direction *changes*, not while it is held. This prevents repeated triggers.
+
+The joystick is used to:
+
+- Move through menu options (up/down)
+- Confirm selections (centre)
+- Navigate between images in the Photo Gallery (left/right)
+- Control Snake movement (all four directions)
+- Control the Pong player paddle (up/down)
+- Return to the previous menu or the Main Menu (centre)
+
+All menus use **circular navigation** — moving past the first or last option wraps around without interruption.
+
+---
+
+## Modules
 
 ### Main Menu
-The entry point after power-on. Displays three options (Photo Gallery, MP3 Player, Games). Joystick up/down moves the highlighted selection; centre confirms. The selected option sets `currentMode` and the super-loop handles the transition.
+
+The central navigation hub. Displays three options — Photo Gallery, MP3 Player, and Games — with the active selection highlighted on the GLCD. The menu updates only when a new joystick movement is detected.
 
 ### Photo Gallery
-Loads one of three images stored as RGB565 pixel arrays in flash. Joystick left/right cycles through the gallery; centre returns to the main menu. Images are rendered instantly via DMA-backed SPI burst transfer.
+
+Displays full-screen images stored as RGB565 C arrays in flash. Images are referenced through a pointer array, allowing the system to cycle through them without dynamic memory allocation. The screen redraws only when the image index changes, minimising flicker.
+
+- Joystick right → next image
+- Joystick left → previous image
+- Joystick centre → return to Main Menu
 
 ### MP3 Player
-Enumerates as a **USB Audio Device** to the host OS — no custom driver required. Windows, macOS, and Linux all recognise it as a standard audio output. PCM audio is streamed over USB isochronous transfers, buffered in USB RAM, and output through the DAC at 32 kHz. The potentiometer sets the final output volume. Press centre to disconnect and return to the menu.
 
-### Snake
-Classic snake on a bordered grid. The snake grows by one segment each time it eats food, which respawns at a random position. The game ends on wall or self-collision and shows a game-over screen with the final score before returning to the game menu.
+Enumerates as a **USB Audio Device** to the host OS — no custom driver required. Windows, macOS, and Linux all recognise it as a standard audio output. PCM audio is streamed over USB isochronous transfers, buffered in USB RAM, and output through the DAC at 32 kHz. The potentiometer controls the final output volume. Pressing centre cleanly shuts down USB and returns to the menu.
 
-### Pong
-Single-player vs CPU pong. The player controls the left paddle with up/down joystick. The CPU paddle tracks the ball's position but misses occasionally. First to 3 points wins. After the game, the result screen is shown briefly before returning to the game menu.
+### Game Module
+
+A secondary menu where the user selects Snake, Pong, or returns to the Main Menu. Each game is an independent submodule with its own menu, gameplay loop, input handling, score tracking, and exit logic.
+
+#### Snake
+
+- Joystick-controlled movement in four directions
+- Continuous movement based on last known direction
+- Random food generation within bounds
+- Snake grows by one segment on food collection
+- Score increments on each food collected
+- Wall and self-collision detection end the game
+- Game-over screen with final score
+
+#### Pong
+
+- Joystick controls the left (player) paddle
+- CPU controls the right paddle and tracks the ball with randomised lag
+- Ball resets to centre after each point
+- First to 3 points wins
+- Win/lose result screen before returning to the game menu
+
+---
+
+## Image Conversion Workflow
+
+The Photo Gallery images are stored as RGB565 C arrays compiled directly into flash.
+
+1. Select a source image
+2. Resize or crop to match the GLCD resolution (240×320)
+3. Convert to RGB565 format
+4. Export as a C array
+5. Place the generated `.c` file in `firmware/images/`
+6. Add a pointer to the image in the `gallery[]` array in `PhotoGallery.c`
 
 ---
 
@@ -132,10 +194,10 @@ Single-player vs CPU pong. The player controls the left paddle with up/down joys
 ```
 .
 ├── firmware/                       Keil uVision 5 project
-│   ├── usbaudio.uvprojx            Project file (open this in Keil)
+│   ├── usbaudio.uvprojx            Project file
 │   ├── DMA.sct                     Linker scatter file — places USB DMA buffer in USB RAM
 │   ├── FLASH.ini                   Flash programming configuration
-│   ├── DebugConfig/                ULINK2 debug probe configuration
+│   ├── DebugConfig/                ULINK debug probe configuration
 │   ├── RTE/                        Keil Run-Time Environment (device pack managed files)
 │   │
 │   ├── src/                        Application logic
@@ -165,70 +227,73 @@ Single-player vs CPU pong. The player controls the left paddle with up/down joys
 │   │   ├── usbhw.c / .h            USB hardware layer (LPC1768 USB peripheral)
 │   │   ├── usbcore.c / .h          USB protocol core (enumeration, control transfers)
 │   │   ├── usbdesc.c / .h          USB descriptors (Audio Class, isochronous endpoint)
-│   │   ├── usbuser.c / .h          USB event callbacks (SOF, EP1 out)
+│   │   ├── usbuser.c / .h          USB event callbacks
 │   │   ├── usbdmain.c              USB DMA interrupt handler
 │   │   ├── usbaudio.h              Audio class constants and buffer sizing
-│   │   ├── usbcfg.h                USB stack configuration (DMA, endpoint count)
+│   │   ├── usbcfg.h                USB stack configuration
 │   │   ├── usbreg.h                USB peripheral register definitions
 │   │   └── usb.h                   USB standard descriptor and request types
 │   │
 │   ├── drivers/                    Board peripheral drivers
 │   │   ├── adcuser.c / .h          USB Audio Device volume/mute control callbacks
-│   │   └── audio.h                 USB Audio class constants (mute, volume controls)
+│   │   └── audio.h                 USB Audio class type definitions
 │   │
 │   └── device/                     CMSIS and NXP device support
 │       ├── core_cm3.c / .h         CMSIS Cortex-M3 core peripheral access
 │       ├── LPC17xx.h               LPC17xx peripheral register map
 │       ├── system_LPC17xx.c / .h   PLL and system clock initialisation
 │       ├── startup_LPC17xx.s       Reset handler, stack setup, vector table
-│       └── type.h                  Primitive type aliases (uint8_t, uint32_t, etc.)
+│       └── type.h                  Primitive type aliases
 │
 ├── docs/                           Documentation and diagrams
-│   ├── Project Flow Chart.png      System flow chart
-│   └── architecture.drawio         Architecture diagram (draw.io)
+│   ├── Project Flow Chart.png
+│   └── architecture.drawio
 │
-├── assets/                         Source images (JPEG originals)
+├── assets/                         Source images (JPEG originals for image conversion)
 │   ├── barcelona.jpg
 │   ├── messi.jpg
 │   └── worldcup.jpg
 │
-└── result/                         Photos of the system running on hardware
+└── result/                         Hardware demo photos
 ```
 
 ---
 
-## Getting Started
+## Testing
 
-### Prerequisites
+The full system was deployed on the LPC1768 board and tested across all modules.
 
-- [Keil MDK-ARM v5](https://www.keil.com/download/product/) (free for LPC1768 with size limit)
-- Keil **LPC1700_DFP** device pack v2.6.0+ (install via Pack Installer in Keil)
-- Keil MCB1700 evaluation board
-- ULINK2 or compatible debug probe (for flashing)
-
-### Build
-
-1. Open `firmware/usbaudio.uvprojx` in Keil uVision 5
-2. Select the **Flash** target from the target dropdown
-3. Click **Build** (F7)
-
-> `Obj/` and `Lst/` are excluded via `.gitignore` and are regenerated on first build.
-
-### Flash
-
-1. Connect the ULINK2 probe to the MCB1700 JTAG header
-2. Power the board
-3. Click **Download** (F8) in Keil uVision
-
-The board boots directly into the main menu.
+| Area | Result |
+|------|--------|
+| Main Menu | Smooth joystick navigation and stable mode transitions |
+| Photo Gallery | Images displayed correctly with minimal flicker |
+| MP3 Player | Audio streamed over USB with responsive volume control |
+| Snake | Movement, scoring, food generation, and collision handling all correct |
+| Pong | Paddle movement, CPU behaviour, collision, scoring, and reset all correct |
+| Mode transitions | All modules returned cleanly to the menu without conflicts |
 
 ---
 
-## USB Audio Setup
+## Key Technical Concepts
 
-1. Connect the MCB1700 **USB** port (not the JTAG port) to a Windows PC with a USB-A cable
-2. Windows automatically installs a generic USB Audio driver — no custom driver needed
-3. Open **Sound Settings** → set the new speaker as the default output device
-4. Play audio on the PC — it streams over USB to the board and outputs through the DAC
-5. Rotate the potentiometer to adjust volume
-6. Press the joystick **centre** button to disconnect USB and return to the main menu
+- Bare-metal embedded programming (no OS)
+- Modular firmware architecture
+- Event-driven control flow with edge-detected joystick input
+- GLCD graphics rendering over SPI
+- RGB565 image storage and display
+- USB Audio Device Class integration
+- Interrupt-driven DAC audio output at 32 kHz
+- Circular DMA buffer for USB audio streaming
+- Timer0 interrupt for sample-accurate audio playback
+- ADC-based potentiometer volume control
+- Real-time game logic (Snake, Pong)
+
+---
+
+## Future Improvements
+
+- Refine Pong ball physics and CPU paddle behaviour
+- Optimise screen redraw performance to reduce flicker further
+- Expand the Photo Gallery with additional images
+- Add more games or interactive modules
+- Improve USB audio error handling for unexpected disconnects

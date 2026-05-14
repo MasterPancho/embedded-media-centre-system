@@ -1,4 +1,4 @@
-# LPC1768 Embedded Entertainment System
+# LPC1768 Embedded Media Centre System
 
 A bare-metal embedded multimedia system built on the **NXP LPC1768** (ARM Cortex-M3) microcontroller for the **Keil MCB1700** evaluation board. Developed for COE718 — Embedded Systems at Toronto Metropolitan University (Fall 2024).
 

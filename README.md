@@ -1,6 +1,6 @@
-# LPC1768 Embedded Entertainment System
+# Embedded Media Centre
 
-A bare-metal embedded multimedia system built on the **NXP LPC1768** (ARM Cortex-M3) microcontroller for the **Keil MCB1700** evaluation board. Developed for COE718 — Embedded Systems at Toronto Metropolitan University (Fall 2024).
+A bare-metal multimedia system for the **NXP LPC1768** (ARM Cortex-M3) microcontroller. Built entirely without an RTOS, it runs a joystick-driven interface with four independent modes: a photo gallery, a USB audio player, a snake game, and a pong game — all displayed on an SPI-driven GLCD.
 
 ---
 
@@ -16,15 +16,27 @@ A bare-metal embedded multimedia system built on the **NXP LPC1768** (ARM Cortex
 
 ---
 
+## Table of Contents
+
+- [Features](#features)
+- [Hardware](#hardware)
+- [Architecture](#architecture)
+- [Modes](#modes)
+- [Project Structure](#project-structure)
+- [Getting Started](#getting-started)
+- [USB Audio Setup](#usb-audio-setup)
+
+---
+
 ## Features
 
-| Mode | Description |
-|------|-------------|
-| Main Menu | Joystick-navigated top-level interface |
-| Photo Gallery | Displays full-color images on the GLCD |
-| MP3 Player | USB Audio Device — streams audio from a host PC |
-| Snake | Classic snake game |
-| Pong | Two-player pong game |
+- Joystick-navigated menu system with instant mode switching
+- Full-colour photo gallery with left/right navigation
+- USB Audio Device — streams PC audio to the on-board DAC in real time
+- Snake game with collision detection, growing body, and score tracking
+- Pong game with CPU-controlled opponent and win/lose detection
+- Potentiometer-controlled volume via ADC
+- No RTOS — fully cooperative bare-metal super-loop
 
 ---
 
@@ -34,9 +46,84 @@ A bare-metal embedded multimedia system built on the **NXP LPC1768** (ARM Cortex
 |-----------|--------|
 | MCU | NXP LPC1768 — ARM Cortex-M3 @ 100 MHz |
 | Board | Keil MCB1700 |
-| Display | GLCD via SPI (Nokia 6610 compatible) |
-| Audio | USB Audio Device (Windows generic driver) |
-| Input | On-board 5-way joystick + potentiometer (ADC) |
+| Display | GLCD 240×320 via SPI (Nokia 6610 compatible) |
+| Audio output | On-board DAC driven by Timer0 IRQ @ 32 kHz |
+| Audio input | USB Audio Device Class (Windows generic driver) |
+| User input | On-board 5-way joystick |
+| Volume control | Potentiometer read via ADC |
+
+---
+
+## Architecture
+
+The firmware is structured as a **bare-metal cooperative super-loop**. There is no scheduler or RTOS — all mode logic runs sequentially in `main()`.
+
+```
+main()
+ ├─ Hardware init: ADC, GLCD, Joystick
+ └─ while(1)
+     ├─ Read joystick state
+     ├─ Mode changed?
+     │   └─ GLCD_Clear() → Init*()   ← runs once on entry
+     └─ Run*()                        ← runs every iteration
+```
+
+### Mode Switching
+
+A single global `AppMode currentMode` variable controls which subsystem is active. When `currentMode` changes, the loop detects the transition, clears the screen, and calls the incoming mode's `Init*()` function exactly once to set up its UI. The `Run*()` function then handles all ongoing logic — joystick polling, state updates, and display redraws — on every loop tick.
+
+```c
+// Simplified from main.c
+if (currentMode != previousMode) {
+    GLCD_Clear(White);
+    Init*();                 // one-time setup
+    previousMode = currentMode;
+}
+Run*(stickDir, &prevStickDir, &currentMode);  // continuous update
+```
+
+Joystick input uses **edge detection** — actions only fire when the direction *changes*, not while it is held. This prevents unintended repeated inputs.
+
+### USB Audio (MP3 Player)
+
+The MP3 Player mode is interrupt-driven rather than polled. When selected, `RunMP3Player()` configures the hardware and hands control to two interrupt handlers:
+
+- **Timer0 IRQ** fires at **32 kHz** (one tick per audio sample). On each tick it reads the next sample from a circular DMA buffer, applies the potentiometer volume, and writes the result to the DAC.
+- **USB IRQ** fires when a new USB isochronous packet arrives from the host PC. It writes the incoming PCM audio data into the DMA buffer.
+
+The two handlers work as a producer/consumer pair — USB fills the buffer, Timer0 drains it to the DAC. A scatter file (`DMA.sct`) explicitly places the USB DMA buffer in the dedicated USB RAM region (`0x2007C000`) required by the LPC1768 hardware.
+
+Pressing the joystick centre while in MP3 mode disables both IRQs, disconnects USB, and returns to the main menu.
+
+### Display
+
+All rendering goes through the GLCD driver (`GLCD_SPI_LPC1700.c`), which communicates with the LCD controller over SPI. Text is drawn using two embedded bitmap fonts (6×8 and 16×24 pixels). Images are stored as **RGB565 C arrays** (`images/*.c`) compiled directly into flash and blasted to the screen with a single `GLCD_Bitmap()` call.
+
+### Games
+
+Both games run their own internal loops (blocking `while` loops) rather than returning to `main()`. This keeps their logic self-contained:
+
+- **Snake** — moves on a 20×10 character grid. The snake body is stored as an array of `{x, y}` structs. Each tick the tail cell is erased, all segments shift forward, and the head advances in the last joystick direction. Collision with walls or self sets `isAlive = false` and ends the loop.
+- **Pong** — tracks ball position as `double {x, y}` with `{dx, dy}` velocity. The CPU paddle follows the ball's y-position with randomised lag to make it beatable. Scoring resets the ball; first to 3 points wins.
+
+---
+
+## Modes
+
+### Main Menu
+The entry point after power-on. Displays three options (Photo Gallery, MP3 Player, Games). Joystick up/down moves the highlighted selection; centre confirms. The selected option sets `currentMode` and the super-loop handles the transition.
+
+### Photo Gallery
+Loads one of three images stored as RGB565 pixel arrays in flash. Joystick left/right cycles through the gallery; centre returns to the main menu. Images are rendered instantly via DMA-backed SPI burst transfer.
+
+### MP3 Player
+Enumerates as a **USB Audio Device** to the host OS — no custom driver required. Windows, macOS, and Linux all recognise it as a standard audio output. PCM audio is streamed over USB isochronous transfers, buffered in USB RAM, and output through the DAC at 32 kHz. The potentiometer sets the final output volume. Press centre to disconnect and return to the menu.
+
+### Snake
+Classic snake on a bordered grid. The snake grows by one segment each time it eats food, which respawns at a random position. The game ends on wall or self-collision and shows a game-over screen with the final score before returning to the game menu.
+
+### Pong
+Single-player vs CPU pong. The player controls the left paddle with up/down joystick. The CPU paddle tracks the ball's position but misses occasionally. First to 3 points wins. After the game, the result screen is shown briefly before returning to the game menu.
 
 ---
 
@@ -44,106 +131,104 @@ A bare-metal embedded multimedia system built on the **NXP LPC1768** (ARM Cortex
 
 ```
 .
-├── firmware/                       Keil uVision 5 project (open usbaudio.uvprojx)
-│   ├── usbaudio.uvprojx            Project definition
-│   ├── DMA.sct                     Linker scatter file — allocates USB RAM for DMA
-│   ├── FLASH.ini                   Flash programming script
-│   ├── Abstract.txt                Project description
-│   ├── DebugConfig/                ULINK debug configuration
-│   ├── RTE/                        Keil Run-Time Environment (device pack files)
+├── firmware/                       Keil uVision 5 project
+│   ├── usbaudio.uvprojx            Project file (open this in Keil)
+│   ├── DMA.sct                     Linker scatter file — places USB DMA buffer in USB RAM
+│   ├── FLASH.ini                   Flash programming configuration
+│   ├── DebugConfig/                ULINK2 debug probe configuration
+│   ├── RTE/                        Keil Run-Time Environment (device pack managed files)
 │   │
-│   ├── src/                        Application source
-│   │   ├── main.c                  Entry point and mode dispatcher
-│   │   ├── MainMenu.c / .h         Top-level navigation menu
-│   │   ├── PhotoGallery.c / .h     Photo viewer
-│   │   ├── MP3Player.c / .h        USB audio player
+│   ├── src/                        Application logic
+│   │   ├── main.c                  Entry point — hardware init and super-loop
+│   │   ├── MainMenu.c / .h         Main menu UI and navigation
+│   │   ├── PhotoGallery.c / .h     Photo viewer — image loading and navigation
+│   │   ├── MP3Player.c / .h        USB audio player — IRQ handlers and DAC output
 │   │   ├── GameMenu.c / .h         Game selection menu
-│   │   └── ModeEnum.h              App mode enum (MENU, PHOTO, MP3, GAME)
+│   │   └── ModeEnum.h              AppMode enum shared across all modules
 │   │
 │   ├── games/                      Game implementations
-│   │   ├── snake.c / .h            Snake game
-│   │   └── pong.c / .h             Pong game
+│   │   ├── snake.c / .h            Snake — grid logic, collision, scoring
+│   │   └── pong.c / .h             Pong — ball physics, CPU AI, scoring
 │   │
-│   ├── display/                    LCD driver and fonts
-│   │   ├── GLCD_SPI_LPC1700.c      SPI LCD driver
-│   │   ├── GLCD.h                  LCD interface
-│   │   ├── Font_6x8_h.h            Small font bitmap
-│   │   └── Font_16x24_h.h          Large font bitmap
+│   ├── display/                    LCD driver and font data
+│   │   ├── GLCD_SPI_LPC1700.c      Low-level SPI LCD driver
+│   │   ├── GLCD.h                  Public LCD API (init, clear, draw, text)
+│   │   ├── Font_6x8_h.h            6×8 pixel bitmap font
+│   │   └── Font_16x24_h.h          16×24 pixel bitmap font
 │   │
-│   ├── images/                     Image pixel data (RGB565 C arrays)
-│   │   ├── barcelona.c             FC Barcelona logo
-│   │   ├── messi.c                 Messi photo
-│   │   └── worldcup.c              World Cup photo
+│   ├── images/                     Image data compiled into flash
+│   │   ├── barcelona.c             RGB565 pixel array — FC Barcelona logo
+│   │   ├── messi.c                 RGB565 pixel array — Messi photo
+│   │   └── worldcup.c              RGB565 pixel array — World Cup photo
 │   │
-│   ├── usb/                        USB Audio stack
-│   │   ├── usbcore.c / .h          USB protocol core
-│   │   ├── usbdesc.c / .h          USB descriptors (Audio Class)
-│   │   ├── usbdmain.c              USB DMA handler
-│   │   ├── usbhw.c / .h            USB hardware abstraction
-│   │   ├── usbuser.c / .h          USB user callbacks
-│   │   ├── usbaudio.h              USB Audio class definitions
-│   │   ├── usbcfg.h                USB configuration
-│   │   └── usbreg.h                USB register map
+│   ├── usb/                        USB Audio Class stack
+│   │   ├── usbhw.c / .h            USB hardware layer (LPC1768 USB peripheral)
+│   │   ├── usbcore.c / .h          USB protocol core (enumeration, control transfers)
+│   │   ├── usbdesc.c / .h          USB descriptors (Audio Class, isochronous endpoint)
+│   │   ├── usbuser.c / .h          USB event callbacks (SOF, EP1 out)
+│   │   ├── usbdmain.c              USB DMA interrupt handler
+│   │   ├── usbaudio.h              Audio class constants and buffer sizing
+│   │   ├── usbcfg.h                USB stack configuration (DMA, endpoint count)
+│   │   ├── usbreg.h                USB peripheral register definitions
+│   │   └── usb.h                   USB standard descriptor and request types
 │   │
-│   ├── drivers/                    Board-level drivers
-│   │   ├── adcuser.c / .h          ADC / potentiometer driver
-│   │   └── audio.h                 Audio type definitions
+│   ├── drivers/                    Board peripheral drivers
+│   │   ├── adcuser.c / .h          USB Audio Device volume/mute control callbacks
+│   │   └── audio.h                 USB Audio class constants (mute, volume controls)
 │   │
-│   └── device/                     CMSIS + NXP device files
-│       ├── core_cm3.c / .h         CMSIS Cortex-M3 core
+│   └── device/                     CMSIS and NXP device support
+│       ├── core_cm3.c / .h         CMSIS Cortex-M3 core peripheral access
 │       ├── LPC17xx.h               LPC17xx peripheral register map
-│       ├── system_LPC17xx.c / .h   System clock initialization
-│       ├── startup_LPC17xx.s       Reset handler and vector table
-│       └── type.h                  Primitive type definitions
+│       ├── system_LPC17xx.c / .h   PLL and system clock initialisation
+│       ├── startup_LPC17xx.s       Reset handler, stack setup, vector table
+│       └── type.h                  Primitive type aliases (uint8_t, uint32_t, etc.)
 │
-├── docs/                           Project documentation
-│   ├── Project Interim Report.pdf
-│   ├── Project Summary.pdf
-│   ├── Project Flow Chart.png
-│   └── Coe718 Project.drawio
+├── docs/                           Documentation and diagrams
+│   ├── Project Flow Chart.png      System flow chart
+│   └── architecture.drawio         Architecture diagram (draw.io)
 │
-└── assets/                         Source images (used to generate images/ pixel data)
-    ├── barcelona.jpg
-    ├── messi.jpg
-    └── worldcup.jpg
+├── assets/                         Source images (JPEG originals)
+│   ├── barcelona.jpg
+│   ├── messi.jpg
+│   └── worldcup.jpg
+│
+└── result/                         Photos of the system running on hardware
 ```
 
 ---
 
-## How It Works
+## Getting Started
 
-`main.c` runs a bare-metal super-loop. A global `currentMode` variable drives which subsystem is active. On every mode change, the screen is cleared and the new mode's `Init*()` function runs exactly once. The corresponding `Run*()` function is then called every loop iteration to handle joystick input and update the display.
+### Prerequisites
 
-```
-main()
- └─ loop
-     ├─ mode changed? → GLCD_Clear() → Init*()
-     └─ always        → Run*()
-```
+- [Keil MDK-ARM v5](https://www.keil.com/download/product/) (free for LPC1768 with size limit)
+- Keil **LPC1700_DFP** device pack v2.6.0+ (install via Pack Installer in Keil)
+- Keil MCB1700 evaluation board
+- ULINK2 or compatible debug probe (for flashing)
 
-The USB MP3 Player is special: it runs entirely from `InitMP3Player()` via USB interrupt handlers and does not need a `Run*()` poll. The potentiometer (ADC) controls playback volume.
+### Build
 
-The image files (`barcelona.c`, `messi.c`, `worldcup.c`) are C arrays of 16-bit RGB565 pixel data generated from the source JPEGs in `assets/`.
+1. Open `firmware/usbaudio.uvprojx` in Keil uVision 5
+2. Select the **Flash** target from the target dropdown
+3. Click **Build** (F7)
 
-A scatter file (`DMA.sct`) is required because the USB peripheral uses DMA and its RAM region must be explicitly placed — do not remove it from the Keil project settings.
+> `Obj/` and `Lst/` are excluded via `.gitignore` and are regenerated on first build.
 
----
+### Flash
 
-## Building
+1. Connect the ULINK2 probe to the MCB1700 JTAG header
+2. Power the board
+3. Click **Download** (F8) in Keil uVision
 
-1. Install **Keil MDK-ARM v5** and the **Keil LPC1700_DFP** device pack (v2.6.0+)
-2. Open `firmware/usbaudio.uvprojx` in Keil uVision
-3. Select the **Flash** target
-4. **Build** → **Download** to flash the LPC1768
-
-> The `Obj/` and `Lst/` build output folders are excluded from this repository via `.gitignore`. They are regenerated automatically on first build.
+The board boots directly into the main menu.
 
 ---
 
 ## USB Audio Setup
 
-1. Connect the MCB1700 USB port to a Windows PC
-2. Windows will detect a generic USB Audio device and add a new speaker
-3. Set that speaker as the audio output in Windows Sound settings
-4. Audio played on the PC is streamed to the board over USB and output via the on-board DAC
-5. Use the potentiometer to adjust volume
+1. Connect the MCB1700 **USB** port (not the JTAG port) to a Windows PC with a USB-A cable
+2. Windows automatically installs a generic USB Audio driver — no custom driver needed
+3. Open **Sound Settings** → set the new speaker as the default output device
+4. Play audio on the PC — it streams over USB to the board and outputs through the DAC
+5. Rotate the potentiometer to adjust volume
+6. Press the joystick **centre** button to disconnect USB and return to the main menu

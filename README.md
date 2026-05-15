@@ -36,7 +36,7 @@ A bare-metal embedded multimedia system built on the **NXP LPC1768 ARM Cortex-M3
 
 The Embedded Media Centre is a standalone application that runs directly on the LPC1768 microcontroller. It provides a graphical menu interface for navigating between three main modules: a Photo Gallery, an MP3 Player, and a Game Module.
 
-The application uses a modular, event-driven architecture to manage transitions between modules while sharing hardware peripherals — the GLCD, joystick, DAC, ADC, Timer0, and USB interface. There is no OS, scheduler, or dynamic memory allocation; all logic runs in a cooperative super-loop with interrupt-driven audio.
+The application uses a modular, event-driven architecture to manage transitions between modules while sharing hardware peripherals — the GLCD, joystick, DAC, ADC, Timer0, and USB interface. All logic runs in a cooperative super-loop with interrupt-driven audio.
 
 ---
 

@@ -1,6 +1,6 @@
 # Embedded Media Centre
 
-A bare-metal embedded multimedia system built on the **NXP LPC1768 ARM Cortex-M3** microcontroller using the **Keil MCB1700** evaluation board. The project integrates graphical rendering, USB audio streaming, real-time joystick interaction, and embedded game logic into a compact multimedia application — all running without an operating system.
+A bare-metal embedded multimedia system built on the **NXP LPC1768 ARM Cortex-M3** microcontroller using the **Keil MCB1700** evaluation board. The project integrates graphical rendering, USB audio streaming, real-time joystick interaction, and embedded game logic into a compact multimedia application.
 
 ---
 
